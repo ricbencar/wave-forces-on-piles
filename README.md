@@ -564,7 +564,8 @@ A standalone Windows application that wraps the C++ solver in a user-friendly in
 ### 7.4.1 Compilation Instructions (MinGW-w64)
 You must link against the Windows subsystem and Unicode libraries.
 ```bash
-g++ -O3 -march=native -std=c++17 -Wall -Wextra -municode -static -static-libgcc -static-libstdc++ -o script_gui.exe script_gui.cpp -mwindows -lm
+g++ -O3 -std=c++17  -Wall -Wextra -static -static-libgcc -static-libstdc++ -o script_gui.exe script_gui.cpp -mwindows -lgdi32
+
 ```
 
 
