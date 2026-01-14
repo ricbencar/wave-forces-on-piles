@@ -276,6 +276,16 @@
 #include <complex>
 #include <limits>
 
+#ifdef __MINGW32__
+#include <stdio.h>
+// Fix for static linking with MinGW GCC 15+
+extern "C" {
+    // Redirect the linker looking for the DLL symbol to the static function
+    int (*__imp_fseeko64)(FILE*, _off64_t, int) = &fseeko64;
+    _off64_t (*__imp_ftello64)(FILE*) = &ftello64;
+}
+#endif
+
 // ==============================================================================
 //  SECTION 1: TYPE DEFINITIONS & CONSTANTS
 // ==============================================================================
