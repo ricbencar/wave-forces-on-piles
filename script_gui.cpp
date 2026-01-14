@@ -149,7 +149,7 @@
  * - Windows API (MinGW or MSVC).
  *
  * COMPILATION INSTRUCTION (MinGW/GCC):
- * g++ -O3 -march=native -std=c++17 -municode script_gui.cpp -o script_gui.exe -mwindows -static
+ * g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ -o script_gui.exe script_gui.cpp -mwindows -lgdi32
  *
  * RUNNING INSTRUCTIONS:
  * 1. Launch `script_gui.exe`.
@@ -295,7 +295,7 @@
 #include <complex>
 #include <limits>
 #include <fstream>
-#include <thread>
+// #include <thread> REMOVED FOR COMPATIBILITY
 
 // ==============================================================================
 //  SECTION 1: MATH TYPES & CONSTANTS
@@ -1236,6 +1236,46 @@ void CreateGUI(HWND hwnd) {
     SendMessageW(hOutput, WM_SETFONT, (WPARAM)hMonoFont, TRUE);
 }
 
+// --- THREADING UTILITIES (REPLACES std::thread) ---
+
+struct ThreadParams {
+    WaveInputs inp;
+    HWND hBtn;
+    HWND hOutput;
+};
+
+// Background worker thread function
+DWORD WINAPI CalculationThread(LPVOID lpParam) {
+    // 1. Unpack parameters
+    ThreadParams* pData = (ThreadParams*)lpParam;
+    WaveInputs inp = pData->inp;
+    HWND hBtn = pData->hBtn;
+    HWND hOutput = pData->hOutput;
+    
+    // Clean up the heap memory from main thread
+    delete pData; 
+
+    // 2. Run the math (Heavy task)
+    std::string report = RunSimulation(inp);
+    
+    // 3. Save to file
+    std::ofstream file("output.txt"); 
+    if (file.is_open()) { file << report; file.close(); }
+
+    // 4. Prepare text for GUI
+    std::wstring wreport = to_wstring(report);
+    std::wstring gui_text = FixNewlinesForGui(wreport);
+
+    // 5. Direct SetWindowText is thread-safe in Win32 for simple text
+    SetWindowTextW(hOutput, gui_text.c_str());
+
+    // 6. Re-enable the button
+    SetWindowTextW(hBtn, L"CALCULATE FORCES");
+    EnableWindow(hBtn, TRUE);
+
+    return 0;
+}
+
 // Window Procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_CREATE) { CreateGUI(hwnd); return 0; }
@@ -1305,36 +1345,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        std::thread worker([inp, hwnd]() {
-            // 1. Run the math (Heavy task)
-            std::string report = RunSimulation(inp);
-            
-            // 2. Save to file
-            std::ofstream file("output.txt"); 
-            if (file.is_open()) { file << report; file.close(); }
+        // 5. Launch Worker Thread (Native Win32, replacing std::thread)
+        // Allocate params on heap; thread will delete them.
+        ThreadParams* params = new ThreadParams;
+        params->inp = inp;
+        params->hBtn = hBtnCalc;
+        params->hOutput = hOutput;
 
-            // 3. Prepare text for GUI
-            std::wstring wreport = to_wstring(report);
-            std::wstring gui_text = FixNewlinesForGui(wreport);
+        HANDLE hThread = CreateThread(
+            NULL,                   // Default security attributes
+            0,                      // Default stack size
+            CalculationThread,      // Thread function
+            params,                 // Argument to thread function
+            0,                      // Default creation flags
+            NULL);                  // Receive thread identifier
 
-            // 4. Update UI (Safe to do in Win32 via message passing)
-            SetWindowTextW(hOutput, gui_text.c_str());
-
-            // 5. Re-enable the button
+        if (hThread) {
+            CloseHandle(hThread); // We don't need to hold the handle
+        } else {
+            // Fallback if thread fails
+            delete params;
             SetWindowTextW(hBtnCalc, L"CALCULATE FORCES");
             EnableWindow(hBtnCalc, TRUE);
-        });
-
-        // Detach allows the thread to run on its own while the main window keeps listening
-        worker.detach();
+            MessageBoxW(hwnd, L"Failed to create thread.", L"Error", MB_ICONERROR);
+        }
         
         return 0; 
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// Entry Point
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+// Entry Point - Changed to WinMain to avoid -municode requirement
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     WNDCLASSEXW wc = {sizeof(WNDCLASSEXW), 0, WndProc, 0, 0, hInstance, LoadIcon(NULL, IDI_APPLICATION), 
                       LoadCursor(NULL, IDC_ARROW), (HBRUSH)(COLOR_WINDOW+1), NULL, L"FentonCalc", LoadIcon(NULL, IDI_APPLICATION)};
     RegisterClassExW(&wc);
