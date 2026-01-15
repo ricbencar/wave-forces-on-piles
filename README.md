@@ -466,11 +466,12 @@ The suite consists of four distinct modules:
 * **Interpreter:** Python 3.8 or higher.
 * **Libraries:**
     ```bash
-    pip install numpy scipy matplotlib
+    pip install numpy scipy matplotlib numba
     ```
     * **NumPy:** Core linear algebra and vectorization.
     * **SciPy:** Nonlinear optimization (`least_squares`) and root finding.
     * **Matplotlib:** Generation of PDF graphical reports.
+	* **Numba:** JIT (Just-In-Time) compilation for accelerating mathematical kernels.
 
 ---
 

@@ -7,6 +7,7 @@
 #  MODULE:   script.py
 #  TYPE:     Nonlinear BVP Solver & Transient Load Calculator
 #  METHOD:   Fenton's Fourier Approximation
+#  ENGINE:   Python 3 + Numba JIT (High Performance)
 #  LICENSE:  MIT / Academic Open Source
 # ==============================================================================
 #
@@ -20,6 +21,12 @@
 #  or Stokes 5th Order approximations, this numerical method satisfies the 
 #  full nonlinear boundary conditions to machine precision (limited only by the 
 #  truncation order N).
+#
+#  OPTIMIZATION NOTE:
+#  This version uses Numba JIT (Just-In-Time) compilation to accelerate the 
+#  core mathematical kernels (Basis functions, Kinematics, and Force Integration).
+#  The "Hot Loops" that run thousands of times are now compiled to machine code,
+#  offering performance comparable to C/Fortran while retaining Python flexibility.
 #
 #  LIMITATIONS:
 #  - Restricted to H/d <= 0.6.
@@ -150,50 +157,31 @@
 #  PREREQUISITES:
 #  - Python 3.8+ (Required for f-strings and type hinting support).
 #  - A standard Python environment (CPython).
+#  - Numba: Required for JIT compilation.
 #
 #  INSTALLATION COMMAND:
-#  $ pip install numpy scipy matplotlib
+#  $ pip install numpy scipy matplotlib numba
 #
 #  LIBRARY BREAKDOWN & UTILIZATION:
 #  -----------------------------------------------------------------------------
 #  1. NumPy (Numerical Python)
 #     - Role: Core Linear Algebra & Tensor Engine.
 #     - Critical Usage in Solver:
-#       * Precision Control: Enforces IEEE 754 Double Precision (float64) for 
-#         all matrix operations. This is vital for the stability of high-order 
-#         Fourier series (N > 20) where truncation errors can cascade.
-#       * Vectorization: Acceleration of trigonometric basis functions 
-#         (sinh, cosh, cos) over spatial grids. This replaces slow Python loops 
-#         with C-optimized array operations during kinematics scanning.
-#       * DFT Operations: Handles discrete Fourier transforms for calculating
-#         integral wave properties (Energy, Impulse, Power).
+#       * Precision Control: Enforces IEEE 754 Double Precision (float64).
+#       * Vectorization: Acceleration of trigonometric basis functions.
 #
 #  2. SciPy (Scientific Python)
 #     - Role: Nonlinear Optimization & Numerical Methods.
-#     - Critical Usage in Solver:
-#       * `scipy.optimize.least_squares`: The engine of the BVP solver. It uses 
-#         the Trust Region Reflective (TRF) algorithm to minimize the error in 
-#         the dynamic boundary condition (Bernoulli head) to machine epsilon 
-#         (~1e-15). It handles the Jacobian matrix estimation for the N+3 
-#         unknowns (Fourier coeffs, wavenumber, flux, head).
-#       * `scipy.optimize.minimize_scalar`: Used in the Force Module to perform 
-#         Bounded Minimization. It locates the exact phase angle (to within 
-#         1e-5 rad) where the combined Drag and Inertia forces peak, ensuring 
-#         conservative design values.
+#     - Critical Usage: `scipy.optimize.least_squares` (TRF Algorithm).
 #
 #  3. Matplotlib (Plotting Library)
-#     - Role: Technical Visualization & Reporting.
-#     - Critical Usage in Solver:
-#       * Backend: Uses the `backend_pdf` driver to generate multi-page, 
-#         vector-graphic PDF reports suitable for engineering documentation.
-#       * Visualization: Plots the nonlinear free surface profile eta(x), 
-#         depth-decay of velocity/acceleration, and the impulsive force 
-#         time-histories necessary for dynamic amplification analysis.
+#     - Role: Technical Visualization & Reporting (PDF/PNG).
 #
-#  4. Standard Library (Built-in)
-#     - `sys`: Used for I/O stream interception (creating the 'DualWriter' 
-#       to simultaneously log to console and text file).
-#     - `time`: Used for benchmarking solver convergence speed.
+#  4. Numba (JIT Compiler)
+#     - Role: Performance Acceleration.
+#     - Usage: Decorates critical math functions (@jit) to compile them 
+#       into optimized machine code, significantly speeding up the solver 
+#       loops and force integration.
 #
 # ==============================================================================
 #  BIBLIOGRAPHY & REFERENCES
@@ -305,6 +293,11 @@ from scipy.optimize import least_squares, minimize_scalar
 import sys
 import os
 
+# -- Numba Imports for JIT Acceleration --
+# We import 'jit' for compilation, 'float64' for type strictness, and 'prange'
+# if parallel loops were needed (kept simple here for stability).
+from numba import jit, float64, int64
+
 # ==============================================================================
 #  SECTION 1: PHYSICAL CONSTANTS & CONFIGURATION
 # ==============================================================================
@@ -329,6 +322,225 @@ DTYPE        = np.float64              # Enforce 64-bit precision for matrix alg
 # -- Plot individual image files --
 DEF_SAVE_PNGS = True
 DEF_PLOT_CYCLES = 2 # Single parameter to control x-axis length (e.g., 1.0, 2.0, 3.5)
+
+# ==============================================================================
+#  SECTION 1.5: NUMBA ACCELERATED KERNELS
+#  These functions perform the heavy lifting and are compiled to machine code.
+# ==============================================================================
+
+@jit(nopython=True, cache=True)
+def _fast_basis(k, d, N, z_vals):
+    """
+    JIT-compiled calculation of Sinh/Cosh basis matrices.
+    Replaces the loop in the original _basis_functions method.
+    """
+    n_z = len(z_vals)
+    S = np.zeros((N, n_z), dtype=np.float64)
+    C = np.zeros((N, n_z), dtype=np.float64)
+    kd = k * d
+    
+    # Loop unrolling for basis functions
+    for j in range(1, N + 1):
+        idx = j - 1
+        arg_check = j * kd
+        
+        # Stability check for large arguments (avoid overflow)
+        if arg_check > 20.0:
+            # Asymptotic approximation
+            for i in range(n_z):
+                val = np.exp(j * k * (z_vals[i] - d))
+                S[idx, i] = val
+                C[idx, i] = val
+        else:
+            denom = np.cosh(j * kd)
+            for i in range(n_z):
+                arg = j * k * z_vals[i]
+                S[idx, i] = np.sinh(arg) / denom 
+                C[idx, i] = np.cosh(arg) / denom
+    return S, C
+
+@jit(nopython=True, cache=True)
+def _fast_residuals(k, etas, Bs, Q, R, d, g, T_target, Uc, current_type_is_eulerian, N, H_curr):
+    """
+    JIT-compiled residual calculation for the optimization solver.
+    This replaces the original _residuals method, avoiding Python overhead 
+    during the 100s of iterations required by least_squares.
+    """
+    if k <= 1e-8: k = 1e-8
+    c = (2 * np.pi) / (k * T_target)
+
+    # Determine frame velocity
+    if current_type_is_eulerian:
+        U_frame = c - Uc
+    else:
+        U_frame = Q / d
+
+    # Calculate Basis matrices (calls the fast kernel above)
+    S_mat, C_mat = _fast_basis(k, d, N, etas)
+    
+    # Grid setup
+    x_nds = np.linspace(0, np.pi / k, N + 1)
+    
+    # Pre-allocate residuals array
+    # Size: (1 Current) + (1 Wave Height) + (1 Level) + (N+1 Kinematic) + (N+1 Dynamic)
+    res_len = 3 + (N+1) + (N+1)
+    residuals = np.zeros(res_len, dtype=np.float64)
+    
+    sc = np.sqrt(g / k**3)
+    
+    # Main Loop over surface nodes
+    for i in range(N + 1):
+        phase = k * x_nds[i]
+        
+        # Summation for stream function (psi), u, and v
+        psi_pert = 0.0
+        u_pert = 0.0
+        v_pert = 0.0
+        
+        for j in range(1, N + 1):
+            idx = j - 1
+            cos_t = np.cos(j * phase)
+            sin_t = np.sin(j * phase)
+            
+            term_common = Bs[idx]
+            psi_pert += term_common * S_mat[idx, i] * cos_t
+            u_pert   += term_common * (j * k) * C_mat[idx, i] * cos_t
+            v_pert   += term_common * (j * k) * S_mat[idx, i] * (-sin_t)
+            
+        psi_pert *= sc
+        u_pert   *= sc
+        v_pert   *= sc
+        
+        # A. Kinematic BC Residual: Psi(eta) = -Q
+        residuals[3 + i] = (-U_frame * etas[i] + psi_pert + Q) / (np.sqrt(g * d) * d)
+        
+        # B. Dynamic BC Residual: Bernoulli Constant
+        u_tot = U_frame - u_pert
+        bern = 0.5 * (u_tot**2 + v_pert**2) + g * etas[i]
+        residuals[3 + (N+1) + i] = (bern - R) / (g * d)
+
+    # Geometric Residuals
+    residuals[1] = (etas[0] - etas[-1] - H_curr) / d
+    
+    # Mean Water Level Residual (Trapezoidal Integration)
+    sum_eta = 0.0
+    for i in range(N + 1):
+        w = 0.5 if (i == 0 or i == N) else 1.0
+        sum_eta += etas[i] * w
+    mean_eta = sum_eta / N
+    residuals[2] = (mean_eta - d) / d
+    
+    # Current Definition Residual
+    residuals[0] = 0.0
+    if not current_type_is_eulerian:
+        residuals[0] = ((c - Q/d) - Uc) / np.sqrt(g * d)
+        
+    return residuals
+
+@jit(nopython=True, cache=True)
+def _fast_kinematics(y, x, k, d, N, Bj, g, c, U_frame, R, rho):
+    """
+    JIT-compiled point kinematics calculator.
+    Returns tuple: (u_fix, v_fix, ax, az, p)
+    """
+    z_arr = np.array([y], dtype=np.float64)
+    # Reuse the fast basis calculation for a single point
+    S_mat, C_mat = _fast_basis(k, d, N, z_arr)
+    # S_mat is (N, 1) here
+    
+    sc = np.sqrt(g / k**3)
+    
+    u_p = 0.0
+    v_p = 0.0
+    dup_dx = 0.0
+    dup_dz = 0.0
+    dwp_dx = 0.0
+    dwp_dz = 0.0
+    
+    # Summation Loop for Field Variables and Gradients
+    for j in range(1, N + 1):
+        idx = j - 1
+        jk = j * k
+        arg_x = jk * x
+        
+        cos_kx = np.cos(arg_x)
+        sin_kx = np.sin(arg_x)
+        
+        B_val = Bj[idx]
+        
+        # Velocities
+        u_p += B_val * jk * C_mat[idx, 0] * cos_kx
+        v_p += B_val * jk * S_mat[idx, 0] * sin_kx 
+        
+        # Gradients (Convective Acceleration Terms)
+        jk2 = jk * jk
+        dup_dx += B_val * jk2 * C_mat[idx, 0] * (-sin_kx)
+        dup_dz += B_val * jk2 * S_mat[idx, 0] * cos_kx
+        dwp_dx += B_val * jk2 * S_mat[idx, 0] * cos_kx
+        dwp_dz += B_val * jk2 * C_mat[idx, 0] * sin_kx
+
+    u_p *= sc
+    v_p *= sc
+    dup_dx *= sc
+    dup_dz *= sc
+    dwp_dx *= sc
+    dwp_dz *= sc
+    
+    # Transform to Fixed Frame
+    u_fix = (c - U_frame) + u_p
+    v_fix = v_p
+    
+    # Calculate Total Acceleration (Convective)
+    # Since flow is steady in moving frame, da/dt = (u-c) * du/dx + w * du/dz
+    ax = (u_fix - c) * dup_dx + v_fix * dup_dz
+    az = (u_fix - c) * dwp_dx + v_fix * dwp_dz
+    
+    # Calculate Pressure (Bernoulli)
+    u_w = U_frame - u_p
+    p = rho * (R - g * y - 0.5 * (u_w**2 + v_p**2))
+    
+    return u_fix, v_fix, ax, az, p
+
+@jit(nopython=True, cache=True)
+def _fast_force_integral(zs, d, k, ph, N, Bj, g, c, U_frame, R, rho, cd, cm, d_eff):
+    """
+    JIT-compiled integration of Morison forces over the depth vector zs.
+    Replaces the loop in scan_force.Significantly speeds up the force scanning phase.
+    """
+    f_tot_sum = 0.0
+    m_tot_sum = 0.0
+    fd_tot = 0.0
+    fi_tot = 0.0
+    
+    n_pts = len(zs)
+    area = np.pi * d_eff**2 / 4.0
+    
+    for i in range(n_pts - 1):
+        z_curr = zs[i]
+        z_next = zs[i+1]
+        
+        dz = z_next - z_curr
+        if dz < 1e-9: continue
+        
+        z_mid = (z_curr + z_next) * 0.5
+        y_bed = z_mid + d
+        
+        # Calculate kinematics inline (calling the fast kernel)
+        u, _, ax, _, _ = _fast_kinematics(y_bed, -ph/k, k, d, N, Bj, g, c, U_frame, R, rho)
+        
+        # Morison Equation Terms
+        fd_local = 0.5 * rho * cd * d_eff * u * np.abs(u)
+        fi_local = rho * cm * area * ax
+        
+        ft_local = fd_local + fi_local
+        
+        # Trapezoidal/Rectangular Integration
+        f_tot_sum += ft_local * dz
+        m_tot_sum += ft_local * dz * y_bed
+        fd_tot += fd_local * dz
+        fi_tot += fi_local * dz
+        
+    return f_tot_sum, m_tot_sum, fd_tot, fi_tot
 
 # ==============================================================================
 #  SECTION 2: I/O UTILITIES & LOGGING
@@ -416,6 +628,9 @@ class FentonWave:
     """
     PRIMARY HYDRODYNAMIC SOLVER:
     Implements the Fourier Approximation Method for the Nonlinear Stream Function.
+    
+    [OPTIMIZATION] This class has been refactored to call static Numba-compiled 
+    kernels (_fast_residuals, _fast_kinematics) for heavy arithmetic.
     """
     def __init__(self, H, T, d, current, current_type='Eulerian', N_target=DEF_SOLVER_ORDER, n_steps=DEF_HOMOTOPY_STEPS):
         # -- 1. Store Inputs --
@@ -493,64 +708,19 @@ class FentonWave:
         R = x[-1]                   
         return k, etas, Bs, Q, R
 
-    def _basis_functions(self, k, eta_or_z_nodes):
-        kd = k * self.d
-        z_vals = np.atleast_1d(eta_or_z_nodes).astype(DTYPE)
-        S = np.zeros((self.N, len(z_vals)), dtype=DTYPE)
-        C = np.zeros((self.N, len(z_vals)), dtype=DTYPE)
-        
-        for j in range(1, self.N + 1):
-            idx = j - 1
-            arg_check = j * kd
-            
-            if arg_check > 20.0:
-                exp_term = np.exp(j * k * (z_vals - self.d))
-                S[idx, :] = exp_term; C[idx, :] = exp_term
-            else:
-                arg = j * k * z_vals
-                denom = np.cosh(j * kd)
-                S[idx, :] = np.sinh(arg) / denom 
-                C[idx, :] = np.cosh(arg) / denom
-
-        return S, C
-
     def _residuals(self, x, H_curr):
+        """
+        Wrapper to call the JIT-compiled residual function.
+        Handles the interface between Scipy (Python) and Numba (C-like speed).
+        """
         k, etas, Bs, Q, R = self._unpack_state(x)
-        if k <= 1e-8: k = 1e-8 
-        c = (2*np.pi)/(k*self.T_target) 
+        is_eulerian = (self.current_type == 'Eulerian')
         
-        if self.current_type == 'Eulerian':
-            U_frame = c - self.Uc
-        else:
-            U_frame = Q / self.d 
-            
-        S_mat, C_mat = self._basis_functions(k, etas)
-        x_nds = np.linspace(0, np.pi/k, self.N+1)
-        phases = k * x_nds
-        js = np.arange(1, self.N+1)
-        
-        cos_t = np.cos(np.outer(js, phases))
-        sc = np.sqrt(self.g / k**3) 
-        
-        psi_pert = np.sum(Bs[:,None]*S_mat*cos_t, axis=0) * sc
-        u_pert   = np.sum(Bs[:,None]*(js[:,None]*k)*C_mat*cos_t, axis=0) * sc
-        v_pert   = np.sum(Bs[:,None]*(js[:,None]*k)*S_mat*(-np.sin(np.outer(js, phases))), axis=0) * sc
-        
-        res_kin = (-U_frame*etas + psi_pert + Q) / (np.sqrt(self.g*self.d)*self.d)
-        
-        u_tot = U_frame - u_pert 
-        bern = 0.5*(u_tot**2 + v_pert**2) + self.g*etas
-        res_dyn = (bern - R) / (self.g*self.d)
-        
-        res_h = (etas[0] - etas[-1] - H_curr)/self.d
-        mean_eta = (np.sum(etas) - 0.5*etas[0] - 0.5*etas[-1])/self.N
-        res_lvl = (mean_eta - self.d)/self.d
-        
-        res_cur = 0.0
-        if self.current_type != 'Eulerian':
-             res_cur = ((c - Q/self.d) - self.Uc) / np.sqrt(self.g*self.d)
-             
-        return np.concatenate(([res_cur, res_h, res_lvl], res_kin, res_dyn))
+        return _fast_residuals(
+            k, etas, Bs, Q, R, 
+            self.d, self.g, self.T_target, self.Uc, 
+            is_eulerian, self.N, H_curr
+        )
 
     def _solve_adaptive(self):
         """
@@ -726,39 +896,22 @@ class FentonWave:
 
     def get_eta_at_x(self, x):
         def func(y):
-            S, _ = self._basis_functions(self.k, [y])
-            S=S.flatten()
+            # Calls the optimized basis function to speed up eta finding
+            S, _ = _fast_basis(self.k, self.d, self.N, y)
+            S = S.flatten()
             psi_p = np.sum(self.Bj * S * np.cos(np.arange(1,self.N+1)*self.k*x)) * np.sqrt(self.g/self.k**3)
             return -self.prop_U_frame*y + psi_p + self.Q
         return least_squares(func, self.d, ftol=1e-14, xtol=1e-14).x[0]
 
     def get_kinematics_at_y(self, y, x):
-        S, C = self._basis_functions(self.k, [y])
-        S = S.flatten(); C = C.flatten()
-        js = np.arange(1, self.N+1)
-        sc = np.sqrt(self.g/self.k**3)
-        
-        term_u = self.Bj * (js*self.k) * C * np.cos(js*self.k*x)
-        u_p = np.sum(term_u) * sc
-        
-        term_w = self.Bj * (js*self.k) * S * (np.sin(js*self.k*x))
-        v_p = np.sum(term_w) * sc 
-        
-        u_fix = (self.c - self.prop_U_frame) + u_p 
-        v_fix = v_p 
-        
-        dup_dx = np.sum(self.Bj * (js*self.k)**2 * C * (-np.sin(js*self.k*x))) * sc
-        dup_dz = np.sum(self.Bj * (js*self.k)**2 * S * np.cos(js*self.k*x)) * sc
-        dwp_dx = np.sum(self.Bj * (js*self.k)**2 * S * (np.cos(js*self.k*x))) * sc
-        dwp_dz = np.sum(self.Bj * (js*self.k)**2 * C * (np.sin(js*self.k*x))) * sc
-
-        ax = (u_fix - self.c) * dup_dx + v_fix * dup_dz
-        az = (u_fix - self.c) * dwp_dx + v_fix * dwp_dz
-        
-        u_w = self.prop_U_frame - u_p
-        p = RHO * (self.R - self.g*y - 0.5*(u_w**2 + v_p**2))
-        
-        return u_fix, v_fix, ax, az, p
+        """
+        Public interface for kinematics.
+        Now redirects to the static JIT-compiled _fast_kinematics kernel.
+        """
+        return _fast_kinematics(
+            y, x, self.k, self.d, self.N, self.Bj, 
+            self.g, self.c, self.prop_U_frame, self.R, RHO
+        )
 
 # ==============================================================================
 #  SECTION 4: HYDRODYNAMIC FORCE MODULE
@@ -797,8 +950,7 @@ def get_morison_coefficients(mg_thickness):
 def scan_force(wave, dia, mg, cm, cd):
     """
     Force Integration Scanner.
-      1. Integrates Morison Force as a distributed load (N/m).
-      2. No Slamming/Impulsive loads (Safe Regime).
+    [OPTIMIZATION] Now utilizes the _fast_force_integral JIT kernel.
     """
     if not wave.converged or wave.k <= 1e-9:
         return {
@@ -819,30 +971,13 @@ def scan_force(wave, dia, mg, cm, cd):
         z_nodes = np.linspace(-wave.d, eta, num_depth_steps)
         zs = np.sort(z_nodes)
         
-        f_tot_sum = 0.0
-        m_tot_sum = 0.0
-        fd_tot = 0.0
-        fi_tot = 0.0
-        
-        # Integration
-        for i in range(len(zs) - 1):
-            z_mid = (zs[i] + zs[i+1]) / 2.0
-            dz = zs[i+1] - zs[i]
-            if dz < 1e-9: continue 
-            
-            u, _, ax, _, _ = wave.get_kinematics_at_y(z_mid + wave.d, -ph/wave.k)
-            
-            # Morison Densities (N/m)
-            fd_local = 0.5 * RHO * cd * d_eff * u * abs(u)
-            fi_local = RHO * cm * (np.pi * d_eff**2 / 4.0) * ax
-            
-            ft_local = fd_local + fi_local 
-            
-            f_tot_sum += ft_local * dz
-            m_tot_sum += ft_local * dz * (z_mid + wave.d)
-            
-            fd_tot += fd_local * dz
-            fi_tot += fi_local * dz
+        # [OPTIMIZATION] Replaced explicit Python loop with call to JIT kernel.
+        # This speeds up the integration significantly.
+        f_tot_sum, m_tot_sum, fd_tot, fi_tot = _fast_force_integral(
+            zs, wave.d, wave.k, ph, wave.N, wave.Bj, 
+            wave.g, wave.c, wave.prop_U_frame, wave.R, 
+            RHO, cd, cm, d_eff
+        )
             
         return f_tot_sum, m_tot_sum, fd_tot, fi_tot
 
@@ -878,6 +1013,7 @@ def scan_force(wave, dia, mg, cm, cd):
     f_final, m_final, fd_final, fi_final = get_force_vector(best_ph, num_depth_steps=500)
     
     # --- STEP 4: Generate Force Density Profile for Plotting ---
+    # (This part is only run once at the end, so no need for JIT optimization here)
     eta = wave.get_eta_at_x(-best_ph/wave.k) - wave.d
     
     disp_z = np.linspace(eta, -wave.d, 51)
@@ -1385,14 +1521,14 @@ def generate_plots(wave, res, h, d, t, dia, mg, cm, cd):
         ph_fft = (t_fft / t) * 2 * np.pi
         f_series = []
         for ph in ph_fft:
+            # Using JIT here indirectly via scan_force's internal helper would be ideal,
+            # but for plotting purposes we stick to the class method to keep code simple.
+            # The bottleneck is not here (4096 points is fast compared to optimization).
             eta = wave.get_eta_at_x(-ph/wave.k) - d
             zs = np.linspace(-d, eta, 40); dz = zs[1] - zs[0]
-            ft_sum = 0
-            for z in zs:
-                u, _, ax, _, _ = wave.get_kinematics_at_y(z+d, -ph/wave.k)
-                fd = 0.5 * RHO * cd * d_eff * u * abs(u)
-                fi = RHO * cm * (np.pi * d_eff**2 / 4.0) * ax
-                ft_sum += (fd+fi) * dz
+            ft_sum, _, _, _ = _fast_force_integral(zs, wave.d, wave.k, ph, wave.N, wave.Bj, 
+                                                   wave.g, wave.c, wave.prop_U_frame, wave.R, 
+                                                   RHO, cd, cm, d_eff)
             f_series.append(ft_sum / 1000.0) 
 
         F_hat = np.fft.fft(f_series)
@@ -1481,6 +1617,8 @@ def generate_plots(wave, res, h, d, t, dia, mg, cm, cd):
         ax6a.legend(fontsize=12, loc='lower right')
         ax6a.grid(True, alpha=0.5)
         ax6a.set_ylim(bottom=-d)
+		
+        add_param_box(ax6a, wave)
         
         # --- CHART 6b: LINE LOAD DENSITY (Right) ---
         add_water_fill(ax6b)
@@ -1528,18 +1666,18 @@ def generate_plots(wave, res, h, d, t, dia, mg, cm, cd):
         for ph in plot_phases:
             eta = wave.get_eta_at_x(-ph/wave.k) - d
             zs = np.linspace(-d, eta, 200); dz = zs[1] - zs[0]
+            
+            # Use JIT kernel for speed, then manually separate components for plotting
+            f_tot_sum, m_tot_sum, fd_tot, fi_tot = _fast_force_integral(
+                zs, wave.d, wave.k, ph, wave.N, wave.Bj, 
+                wave.g, wave.c, wave.prop_U_frame, wave.R, 
+                RHO, cd, cm, d_eff
+            )
 
-            fd_sum = 0; fi_sum = 0; m_sum = 0
-            for z in zs:
-                u, _, ax, _, _ = wave.get_kinematics_at_y(z+d, -ph/wave.k)
-                fd = 0.5 * RHO * cd * d_eff * u * abs(u)
-                fi = RHO * cm * (np.pi * d_eff**2 / 4.0) * ax
-                fd_sum += fd*dz; fi_sum += fi*dz
-                m_sum += (fd+fi) * dz * (z+d)
-
-            forces_total.append((fd_sum+fi_sum)/1000.0)
-            forces_drag.append(fd_sum/1000.0); forces_inertia.append(fi_sum/1000.0)
-            moments_total.append(m_sum/1000.0)
+            forces_total.append(f_tot_sum/1000.0)
+            forces_drag.append(fd_tot/1000.0)
+            forces_inertia.append(fi_tot/1000.0)
+            moments_total.append(m_tot_sum/1000.0)
 
         forces_total = np.array(forces_total)
         moments_total = np.array(moments_total)
@@ -1556,7 +1694,6 @@ def generate_plots(wave, res, h, d, t, dia, mg, cm, cd):
         ax7a.set_title("Base Shear Force", fontsize=16); ax7a.legend(loc='upper right', fontsize=12); ax7a.grid(True, alpha=0.5)
         ax7a.set_xlim(0, t * DEF_PLOT_CYCLES)
         
-        # Updated Phase Axis (Dynamic Scaling)
         max_deg = 360 * DEF_PLOT_CYCLES
         ax7a_ph = ax7a.twiny(); ax7a_ph.set_xlim(0, max_deg)
         ax7a_ph.set_xlabel("Phase (degrees)", color='darkred', fontsize=12)
@@ -1583,7 +1720,6 @@ def generate_plots(wave, res, h, d, t, dia, mg, cm, cd):
         ax7b.grid(True, alpha=0.5)
         ax7b.set_xlim(0, t * DEF_PLOT_CYCLES)
 
-        # Updated Phase Axis (Dynamic Scaling)
         ax7b_ph = ax7b.twiny(); ax7b_ph.set_xlim(0, max_deg)
         ax7b_ph.set_xlabel("Phase (degrees)", color='darkred', fontsize=12)
         ax7b_ph.set_xticks(np.arange(0, max_deg + 0.1, tick_step))
