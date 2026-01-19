@@ -96,7 +96,7 @@
  * 0.5 * [ (dPsi/dX)^2 + (dPsi/dz)^2 ] + g * eta(X) = R
  * Where R is the Bernoulli constant (Total Energy Head).
  *
- * 3. NUMERICAL SOLVER ALGORITHM (C++ IMPLEMENTATION)
+ * 3. NUMERICAL SOLVER ALGORITHM
  * -----------------------------------------------------------------------------
  * The problem is recast as a nonlinear optimization problem.
  *
@@ -149,7 +149,7 @@
  * - Windows API (MinGW or MSVC).
  *
  * COMPILATION INSTRUCTION (MinGW/GCC):
- * g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ -o script_gui.exe script_gui.cpp -mwindows -lgdi32
+ * g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ -o script_gui.exe script_gui.cpp -mwindows -lgdi32 -lwinpthread
  *
  * RUNNING INSTRUCTIONS:
  * 1. Launch `script_gui.exe`.
@@ -279,8 +279,37 @@
  * ==============================================================================
  */
 
+// ==============================================================================
+//  MINGW STATIC LINKING FIX (GCC 15+)
+// ==============================================================================
+#ifdef __MINGW32__
+#include <stdio.h>
+#include <time.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+extern "C" {
+    // 1. Fix file offset symbols for static linking
+    int (*__imp_fseeko64)(FILE*, _off64_t, int) = &fseeko64;
+    _off64_t (*__imp_ftello64)(FILE*) = &ftello64;
+
+    // 2. Fix missing nanosleep64
+    // MUST use struct _timespec64 to match MinGW system headers
+    int nanosleep64(const struct _timespec64 *req, struct _timespec64 *rem) {
+        // Silence unused parameter warning
+        (void)rem; 
+        
+        if (!req) return -1;
+        
+        // Convert seconds + nanoseconds to milliseconds for Windows Sleep()
+        DWORD ms = (DWORD)(req->tv_sec * 1000 + req->tv_nsec / 1000000);
+        Sleep(ms);
+        return 0;
+    }
+}
+#endif
+
 #define _USE_MATH_DEFINES 
-#define NOMINMAX
 
 #include <windows.h>
 #include <commctrl.h>
@@ -295,7 +324,9 @@
 #include <complex>
 #include <limits>
 #include <fstream>
-// #include <thread> REMOVED FOR COMPATIBILITY
+#include <thread>
+#include <future>
+#include <mutex>
 
 // ==============================================================================
 //  SECTION 1: MATH TYPES & CONSTANTS
@@ -367,6 +398,39 @@ public:
     // Reset buffer
     void clear() { buffer.str(""); buffer.clear(); }
 };
+
+// ==============================================================================
+//  PARALLEL UTILITIES (NEW)
+// ==============================================================================
+namespace ParallelUtils {
+    template<typename Func>
+    void parallel_for(int start, int end, Func f) {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads < 2) num_threads = 2; 
+        
+        int total = end - start;
+        if (total <= 0) return;
+        
+        int block_size = total / num_threads;
+        if (block_size == 0) block_size = 1;
+        if (block_size * num_threads > total) num_threads = total / block_size + (total % block_size > 0);
+
+        std::vector<std::future<void>> futures;
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            int t_start = start + t * block_size;
+            int t_end = (t == num_threads - 1) ? end : t_start + block_size;
+            
+            // Launch async task
+            futures.push_back(std::async(std::launch::async, [t_start, t_end, f]() {
+                for (int i = t_start; i < t_end; ++i) {
+                    f(i);
+                }
+            }));
+        }
+        // Wait for all threads to finish
+        for(auto& fut : futures) fut.wait();
+    }
+}
 
 // ==============================================================================
 //  SECTION 3: MATHEMATICAL KERNEL
@@ -670,20 +734,28 @@ private:
 
     Matrix compute_jacobian_complex(const Vector& x_val, Real target_h) {
         int n = x_val.size();
-        VectorC x_c(n); for(int i=0; i<n; ++i) x_c[i] = Complex(x_val[i], 0.0);
+        VectorC x_base(n); for(int i=0; i<n; ++i) x_base[i] = Complex(x_val[i], 0.0);
         Vector r_base = residuals(x_val, target_h);
         int m = r_base.size();
         Matrix J(m, Vector(n));
         Real h_step = 1.0e-20; 
-        std::vector<Complex> r_c_buffer; r_c_buffer.reserve(m);
 
-        for(int j=0; j<n; ++j) {
-            x_c[j].imag(h_step);
-            residuals_internal_optimized<Complex>(x_c, target_h, r_c_buffer);
+        // MULTI-CORE JACOBIAN CALCULATION
+        ParallelUtils::parallel_for(0, n, [&](int j) {
+            // Local copy for each thread is critical
+            VectorC x_local = x_base;
+            std::vector<Complex> r_c_buffer;
+            
+            x_local[j].imag(h_step);
+            residuals_internal_optimized<Complex>(x_local, target_h, r_c_buffer);
             Real inv_h = 1.0 / h_step;
-            for(int i=0; i<m; ++i) J[i][j] = std::imag(r_c_buffer[i]) * inv_h;
-            x_c[j].imag(0.0);
-        }
+            
+            // Writing to distinct columns is thread-safe
+            for(int i=0; i<m; ++i) {
+                J[i][j] = std::imag(r_c_buffer[i]) * inv_h;
+            }
+        });
+
         return J;
     }
 
@@ -877,13 +949,30 @@ void calculate_forces(FentonWave& wave, Real D, Real mg, Real Cd, Real Cm, Force
         return std::vector<Real>{F, M, Fd, Fi};
     };
     
-    // Coarse Search for Max Force
-    Real best_ph = 0, max_F = 0, max_M_true = 0;
-    for(int i=0; i<360; ++i) {
+    // MULTI-CORE FORCE SEARCH
+    Real best_ph = 0;
+    
+    // Thread-safe buffers
+    std::vector<Real> results_F(360);
+    std::vector<Real> results_M(360);
+
+    ParallelUtils::parallel_for(0, 360, [&](int i) {
         Real ph = i * (2*Phys::PI/360.0);
         auto f = get_force(ph);
-        if(std::abs(f[0]) > max_F) { max_F = std::abs(f[0]); best_ph = ph; }
-        if(std::abs(f[1]) > max_M_true) max_M_true = std::abs(f[1]);
+        results_F[i] = f[0];
+        results_M[i] = f[1];
+    });
+
+    // Reduce results to find max
+    Real max_F = 0, max_M_true = 0;
+    for(int i=0; i<360; ++i) {
+        if(std::abs(results_F[i]) > max_F) { 
+            max_F = std::abs(results_F[i]); 
+            best_ph = i * (2*Phys::PI/360.0); 
+        }
+        if(std::abs(results_M[i]) > max_M_true) {
+            max_M_true = std::abs(results_M[i]);
+        }
     }
     
     // Fine Optimization using Golden Section Search

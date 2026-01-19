@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * HIGH-PRECISION WAVE HYDRODYNAMICS & STRUCTURAL IMPACT SOLVER (C++ PORT)
+ * HIGH-PRECISION WAVE HYDRODYNAMICS & STRUCTURAL IMPACT SOLVER
  * ==============================================================================
  * MODULE:   script_cli.cpp
  * TYPE:     Nonlinear BVP Solver & Transient Load Calculator
@@ -90,7 +90,7 @@
  * 0.5 * [ (dPsi/dX)^2 + (dPsi/dz)^2 ] + g * eta(X) = R
  * Where R is the Bernoulli constant (Total Energy Head).
  *
- * 3. NUMERICAL SOLVER ALGORITHM (C++ IMPLEMENTATION)
+ * 3. NUMERICAL SOLVER ALGORITHM
  * -----------------------------------------------------------------------------
  * The problem is recast as a nonlinear optimization problem.
  *
@@ -142,7 +142,7 @@
  * - Standard Template Library (STL).
  *
  * COMPILATION INSTRUCTION:
- * $ g++ -O3 -march=native -std=c++17 -Wall -Wextra -static -static-libgcc -static-libstdc++ -o script_cli.exe script_cli.cpp -lm
+ * g++ -O3 -march=native -std=c++17 -Wall -Wextra -static -static-libgcc -static-libstdc++ -o script_cli.exe script_cli.cpp -lwinpthread
  *
  * RUNNING INSTRUCTIONS:
  * 1. Interactive Mode: Run `script.exe` and follow prompts.
@@ -263,6 +263,33 @@
  * ==============================================================================
  */
 
+#ifdef __MINGW32__
+#include <stdio.h>
+#include <time.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+extern "C" {
+    // 1. Fix file offset symbols
+    int (*__imp_fseeko64)(FILE*, _off64_t, int) = &fseeko64;
+    _off64_t (*__imp_ftello64)(FILE*) = &ftello64;
+
+    // 2. Fix missing nanosleep64
+    // MUST use struct _timespec64 to match MinGW system headers
+    int nanosleep64(const struct _timespec64 *req, struct _timespec64 *rem) {
+        // Silence unused parameter warning
+        (void)rem; 
+        
+        if (!req) return -1;
+        
+        // Convert seconds + nanoseconds to milliseconds for Windows Sleep()
+        DWORD ms = (DWORD)(req->tv_sec * 1000 + req->tv_nsec / 1000000);
+        Sleep(ms);
+        return 0;
+    }
+}
+#endif
+
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -275,16 +302,9 @@
 #include <sstream>
 #include <complex>
 #include <limits>
-
-#ifdef __MINGW32__
-#include <stdio.h>
-// Fix for static linking with MinGW GCC 15+
-extern "C" {
-    // Redirect the linker looking for the DLL symbol to the static function
-    int (*__imp_fseeko64)(FILE*, _off64_t, int) = &fseeko64;
-    _off64_t (*__imp_ftello64)(FILE*) = &ftello64;
-}
-#endif
+#include <thread>
+#include <future>
+#include <mutex>
 
 // ==============================================================================
 //  SECTION 1: TYPE DEFINITIONS & CONSTANTS
@@ -320,6 +340,41 @@ namespace Phys {
     constexpr Real RHO         = 1025.0;       
     constexpr Real G_STD       = 9.8066;     
     constexpr Real NU_SEAWATER = 1.05e-6; 
+}
+
+// ==============================================================================
+//  PARALLEL UTILITIES (NEW)
+// ==============================================================================
+namespace ParallelUtils {
+    template<typename Func>
+    void parallel_for(int start, int end, Func f) {
+        int num_threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (num_threads < 2) num_threads = 2; 
+        
+        int total = end - start;
+        if (total <= 0) return;
+        
+        int block_size = total / num_threads;
+        if (block_size == 0) block_size = 1;
+        
+        if (block_size * num_threads > total) {
+            num_threads = total / block_size + (total % block_size > 0);
+        }
+
+        std::vector<std::future<void>> futures;
+        for (int t = 0; t < num_threads; ++t) {
+            int t_start = start + t * block_size;
+            int t_end = (t == num_threads - 1) ? end : t_start + block_size;
+            
+            futures.push_back(std::async(std::launch::async, [t_start, t_end, f]() {
+                for (int i = t_start; i < t_end; ++i) {
+                    f(i);
+                }
+            }));
+        }
+        // Wait for all threads to finish
+        for(auto& fut : futures) fut.wait();
+    }
 }
 
 // ==============================================================================
@@ -807,28 +862,31 @@ private:
     Matrix compute_jacobian_complex(const Vector& x_val, Real target_h) {
         int n = x_val.size();
         
-        VectorC x_c(n);
-        for(int i=0; i<n; ++i) x_c[i] = Complex(x_val[i], 0.0);
+        VectorC x_base(n);
+        for(int i=0; i<n; ++i) x_base[i] = Complex(x_val[i], 0.0);
         
         Vector r_base = residuals(x_val, target_h);
         int m = r_base.size();
         
         Matrix J(m, Vector(n));
         Real h_step = 1.0e-20; 
-        
-        std::vector<Complex> r_c_buffer;
-        r_c_buffer.reserve(m);
 
-        for(int j=0; j<n; ++j) {
-            x_c[j].imag(h_step);
-            residuals_internal_optimized<Complex>(x_c, target_h, r_c_buffer);
+        // MULTI-CORE JACOBIAN CALCULATION
+        ParallelUtils::parallel_for(0, n, [&](int j) {
+            // Local copy for each thread is critical
+            VectorC x_local = x_base;
+            std::vector<Complex> r_c_buffer;
             
+            x_local[j].imag(h_step);
+            residuals_internal_optimized<Complex>(x_local, target_h, r_c_buffer);
             Real inv_h = 1.0 / h_step;
+            
+            // Writing to distinct columns is thread-safe
             for(int i=0; i<m; ++i) {
                 J[i][j] = std::imag(r_c_buffer[i]) * inv_h;
             }
-            x_c[j].imag(0.0);
-        }
+        });
+
         return J;
     }
 
@@ -953,7 +1011,6 @@ private:
             if (err > 1e-5) status = "FAIL"; // Tightened failure check
             
             if (is_last) {
-                // Convergence classification logic updated for 1e-16 target
                 if (err < 1e-14) final_status = "CONVERGED"; 
                 else if (err < 2e-3) final_status = "ACCEPTED";
                 else final_status = "DRIFT";
@@ -1111,15 +1168,27 @@ void calculate_forces(FentonWave& wave, Real D, Real mg, Real Cd, Real Cm, Force
     
     Real best_ph = 0, max_F = 0, max_M_true = 0;
     
-    // 1. Coarse Scan
-    for(int i=0; i<360; ++i) {
+    // MULTI-CORE FORCE SEARCH
+    // Thread-safe buffers
+    std::vector<Real> results_F(360);
+    std::vector<Real> results_M(360);
+
+    ParallelUtils::parallel_for(0, 360, [&](int i) {
         Real ph = i * (2*Phys::PI/360.0);
         auto f = get_force(ph);
-        if(std::abs(f[0]) > max_F) { 
-            max_F = std::abs(f[0]); 
-            best_ph = ph; 
+        results_F[i] = f[0];
+        results_M[i] = f[1];
+    });
+
+    // Reduce results to find max
+    for(int i=0; i<360; ++i) {
+        if(std::abs(results_F[i]) > max_F) { 
+            max_F = std::abs(results_F[i]); 
+            best_ph = i * (2*Phys::PI/360.0); 
         }
-        if(std::abs(f[1]) > max_M_true) max_M_true = std::abs(f[1]);
+        if(std::abs(results_M[i]) > max_M_true) {
+            max_M_true = std::abs(results_M[i]);
+        }
     }
     
     // 2. Fine Optimization: Golden Section Search
@@ -1130,7 +1199,7 @@ void calculate_forces(FentonWave& wave, Real D, Real mg, Real Cd, Real Cm, Force
     // Search window +/- 0.3 rad around coarse peak
     Real a = best_ph - 0.3;
     Real b = best_ph + 0.3;
-    best_ph = golden_section_search(optim_target, a, b, 1e-9); // Precision updated to 1e-9
+    best_ph = golden_section_search(optim_target, a, b, 1e-9);
     
     auto f_final = get_force(best_ph);
     res.F_max = f_final[0]; 
@@ -1301,7 +1370,6 @@ int main(int argc, char* argv[]) {
     String brk_msg = "STABLE (No Breaking)";
     if (H > H_limit) brk_msg = "CAUTION: WAVE NEAR BREAKING LIMIT";
     
-    // UPDATED: Now includes (H/d) value
     std::stringstream ss_stab;
     ss_stab << " STABILITY CHECK:      " << brk_msg 
             << " (H/d = " << std::fixed << std::setprecision(3) << (H/d) << ")";
