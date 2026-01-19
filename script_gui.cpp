@@ -309,8 +309,6 @@ extern "C" {
 }
 #endif
 
-#define _USE_MATH_DEFINES 
-
 #include <windows.h>
 #include <commctrl.h>
 #include <string>
